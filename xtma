@@ -1,0 +1,18 @@
+# 3. 上下文管理器：自动计时 + 异常捕获
+from contextlib import contextmanager
+import time
+
+@contextmanager
+def measure(label):
+    start = time.perf_counter()
+    try:
+        yield
+    except Exception as e:
+        print(f"[{label}] 出错: {e}")
+        raise
+    finally:
+        print(f"[{label}] 用时 {time.perf_counter() - start:.4f}s")
+
+with measure("计算块"):
+    total = sum(range(1_000_000))
+    print("结果:", total)
