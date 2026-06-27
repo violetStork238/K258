@@ -1,0 +1,120 @@
+-- Redis Lua 脚本：令牌桶限流器
+-- 调用方式：EVALSHA <sha> 1 <key> <capacity> <refill_rate> <refill_interval> <tokens_needed> <now>
+--
+-- 参数说明：
+--   key              : 限流唯一标识（如 "rate:user:123:api:/search"）
+--   capacity         : 桶容量（最大令牌数）
+--   refill_rate      : 每次补充的令牌数
+--   refill_interval  : 补充间隔（毫秒）
+--   tokens_needed    : 本次请求消耗的令牌数
+--   now              : 当前时间戳（毫秒），由调用方传入确保一致性
+
+local key              = KEYS[1]
+local capacity         = tonumber(ARGV[1])
+local refill_rate      = tonumber(ARGV[2])
+local refill_interval  = tonumber(ARGV[3])
+local tokens_needed    = tonumber(ARGV[4])
+local now              = tonumber(ARGV[5])
+
+-- 从 Redis 读取当前桶状态
+local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
+local current_tokens = tonumber(bucket[1])
+local last_refill     = tonumber(bucket[2])
+
+-- 首次请求：初始化为满桶
+if current_tokens == nil then
+    current_tokens = capacity
+    last_refill    = now
+end
+
+-- 计算自上次补充以来经过了多少个补充周期
+local elapsed_intervals = math.floor((now - last_refill) / refill_interval)
+local new_last_refill   = last_refill + elapsed_intervals * refill_interval
+
+-- 补充令牌（不超过桶容量）
+local refilled_tokens = math.min(
+    capacity,
+    current_tokens + elapsed_intervals * refill_rate
+)
+
+-- 判断是否有足够令牌
+local allowed    = 0
+local remaining  = refilled_tokens
+local retry_after = 0
+
+if refilled_tokens >= tokens_needed then
+    allowed   = 1
+    remaining = refilled_tokens - tokens_needed
+
+    -- 计算 TTL：桶耗尽后多久可以再次请求
+    local ttl_ms = math.ceil(capacity / refill_rate) * refill_interval + refill_interval
+    local ttl_s  = math.ceil(ttl_ms / 1000)
+
+    redis.call('HMSET', key,
+        'tokens',      remaining,
+        'last_refill', new_last_refill
+    )
+    redis.call('PEXPIRE', key, ttl_ms)
+else
+    -- 计算需要等待多久才能有足够令牌
+    local deficit          = tokens_needed - refilled_tokens
+    local intervals_needed = math.ceil(deficit / refill_rate)
+    retry_after            = intervals_needed * refill_interval  -- 毫秒
+
+    -- 仍然更新已补充的令牌（但不消耗）
+    redis.call('HMSET', key,
+        'tokens',      refilled_tokens,
+        'last_refill', new_last_refill
+    )
+    redis.call('PEXPIRE', key, retry_after + refill_interval)
+end
+
+-- 返回：[allowed, remaining_tokens, retry_after_ms, capacity, reset_at_ms]
+local reset_at = new_last_refill + math.ceil(
+    (capacity - remaining) / refill_rate
+) * refill_interval
+
+return {
+    allowed,
+    math.floor(remaining),
+    retry_after,
+    capacity,
+    reset_at
+}
+
+-- ============================================================
+-- Python 调用示例
+-- ============================================================
+--[[
+import redis
+import time
+
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+
+SCRIPT = open('rate_limiter.lua').read()
+sha = r.script_load(SCRIPT)
+
+def check_rate_limit(user_id: str, endpoint: str,
+                     capacity=100, refill_rate=10,
+                     refill_interval=1000, tokens_needed=1):
+    key = f"rate:{user_id}:{endpoint}"
+    now = int(time.time() * 1000)
+    result = r.evalsha(sha, 1, key,
+                       capacity, refill_rate,
+                       refill_interval, tokens_needed, now)
+    allowed, remaining, retry_after, cap, reset_at = result
+    return {
+        "allowed": bool(allowed),
+        "remaining": remaining,
+        "retry_after_ms": retry_after,
+        "capacity": cap,
+        "reset_at": reset_at / 1000
+    }
+
+# 模拟突发请求
+for i in range(15):
+    res = check_rate_limit("user_123", "/api/search", capacity=10, refill_rate=2, refill_interval=1000)
+    status = "✅ ALLOW" if res["allowed"] else f"❌ DENY (retry in {res['retry_after_ms']}ms)"
+    print(f"Request {i+1:>2}: {status} | remaining={res['remaining']}")
+    time.sleep(0.1)
+]]
